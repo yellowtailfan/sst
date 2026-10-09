@@ -258,6 +258,7 @@ func function(ctx context.Context, input input) {
 	})
 
 	workerEnv := map[string][]string{}
+	workerFunction := map[string]string{}
 	builds := map[string]*runtime.BuildOutput{}
 	targets := map[string]*runtime.BuildInput{}
 
@@ -399,6 +400,7 @@ func function(ctx context.Context, input input) {
 				}
 				log.Info("worker init", "workerID", msg.Source, "functionID", init.FunctionID)
 				workerEnv[workerID] = init.Environment
+				workerFunction[workerID] = init.FunctionID
 				if ok := startWorker(init.FunctionID, workerID); !ok {
 					result, err := http.Post("http://"+server+workerID+"/runtime/init/error", "application/json", strings.NewReader(`{"errorMessage":"Function failed to build"}`))
 					if err != nil {
@@ -441,6 +443,15 @@ func function(ctx context.Context, input input) {
 					nextChan[msg.Source] = ch
 				}
 				_, ok = workers[msg.Source]
+				// A worker that exited idle is started again from its last Init, rather than by asking
+				// the bridge for a Reboot: AppSync can drop that message, and the request then waits
+				// out its timeout with nothing running it.
+				if fid, known := workerFunction[msg.Source]; !ok && known {
+					if _, built := targets[fid]; built && startWorker(fid, msg.Source) {
+						log.Info("restarted worker from its last init", "workerID", msg.Source)
+						ok = true
+					}
+				}
 				if !ok {
 					log.Info("asking for reboot", "workerID", msg.Source)
 					writer := input.client.NewWriter(bridge.MessageReboot, input.prefix+"/"+msg.Source+"/in")
