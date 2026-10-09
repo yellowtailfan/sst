@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -154,10 +155,23 @@ func run() error {
 		}
 		timeout := time.Second * 16
 		timer := time.NewTimer(timeout)
-		// Once sst dev has the request (its ping), a reply that does not arrive is asked for again:
-		// AppSync can accept a publish and never deliver it.
+		// AppSync can accept a publish and never deliver it -- the ping, the reply, or one chunk of
+		// it -- so each second without a whole reply asks for it again; sst dev ignores an ask for a
+		// reply it does not have yet. A reply is read whole before Lambda is given it, so a missing
+		// chunk does not stall the loop that asks for it.
 		resend := time.NewTicker(time.Second)
-		pinged := false
+		type reply struct {
+			url  string
+			body []byte
+		}
+		complete := make(chan reply, 1)
+		invocationURL := "http://" + LAMBDA_RUNTIME_API + "/2018-06-01/runtime/invocation/" + requestID
+		collect := func(url string, body io.Reader) {
+			go func() {
+				data, _ := io.ReadAll(body)
+				complete <- reply{url, data}
+			}()
+		}
 
 	loop:
 		for {
@@ -165,12 +179,13 @@ func run() error {
 			case <-ctx.Done():
 				return nil
 			case <-resend.C:
-				if pinged {
-					writer := client.NewWriter(bridge.MessageResend, prefix+"/in")
-					json.NewEncoder(writer).Encode(bridge.ResendBody{RequestID: requestID})
-					writer.Close()
-					fmt.Println("asked for the reply again", requestID)
-				}
+				writer := client.NewWriter(bridge.MessageResend, prefix+"/in")
+				json.NewEncoder(writer).Encode(bridge.ResendBody{RequestID: requestID})
+				writer.Close()
+				fmt.Println("asked for the reply again", requestID)
+			case r := <-complete:
+				http.Post(r.url, "application/json", bytes.NewReader(r.body))
+				break loop
 			case msg := <-client.Read():
 				timer.Reset(timeout)
 				fmt.Println("got message", msg.Type)
@@ -188,14 +203,14 @@ func run() error {
 						if _, err := http.DefaultClient.Do(req); err != nil {
 							fmt.Println("failed to send streaming response", err)
 						}
-					} else {
-						http.Post(responseURL, "application/json", msg.Body)
+						break loop
 					}
-					break loop
+					collect(responseURL, msg.Body)
+					continue
 				}
 				if msg.Type == bridge.MessageError && msg.ID == requestID {
-					http.Post("http://"+LAMBDA_RUNTIME_API+"/2018-06-01/runtime/invocation/"+requestID+"/error", "application/json", msg.Body)
-					break loop
+					collect(invocationURL+"/error", msg.Body)
+					continue
 				}
 				if msg.Type == bridge.MessageInitError {
 					http.Post("http://"+LAMBDA_RUNTIME_API+"/2018-06-01/runtime/invocation/"+requestID+"/error", "application/json", msg.Body)
@@ -208,7 +223,6 @@ func run() error {
 				if msg.Type == bridge.MessagePing {
 					timeout = time.Minute * 15
 					timer.Reset(timeout)
-					pinged = true
 					continue
 				}
 			case <-timer.C:
