@@ -95,7 +95,9 @@ func run() error {
 		return err
 	}
 	client := bridge.NewClient(ctx, conn, workerID, prefix+"/"+workerID)
-	awaitEcho(client, prefix+"/"+workerID+"/in")
+	own := prefix + "/" + workerID + "/in"
+	awaitEcho(client, own, nil)
+	echoed := conn.Generation()
 
 	init := bridge.InitBody{
 		FunctionID:  SST_FUNCTION_ID,
@@ -108,9 +110,13 @@ func run() error {
 		}
 		init.Environment = append(init.Environment, e)
 	}
-	writer := client.NewWriter(bridge.MessageInit, prefix+"/in")
-	json.NewEncoder(writer).Encode(init)
-	writer.Close()
+	announce := func() {
+		writer := client.NewWriter(bridge.MessageInit, prefix+"/in")
+		json.NewEncoder(writer).Encode(init)
+		writer.Close()
+	}
+	announce()
+	lastDone := time.Now()
 
 	notRunning, _ := json.Marshal(map[string]string{
 		"statusCode": "500",
@@ -125,6 +131,15 @@ func run() error {
 			return err
 		}
 		requestID := resp.Header.Get("lambda-runtime-aws-request-id")
+		// An idle instance may wake to a dead connection and resubscribe, so check it delivers first.
+		if conn.Generation() != echoed || time.Since(lastDone) > 30*time.Second {
+			awaitEcho(client, own, func(msg bridge.Message) {
+				if msg.Type == bridge.MessageReboot {
+					announce()
+				}
+			})
+			echoed = conn.Generation()
+		}
 		writer := client.NewWriter(bridge.MessageNext, prefix+"/in")
 		err = resp.Write(writer)
 		if err != nil {
@@ -158,9 +173,7 @@ func run() error {
 					break loop
 				}
 				if msg.Type == bridge.MessageReboot {
-					writer := client.NewWriter(bridge.MessageInit, prefix+"/in")
-					json.NewEncoder(writer).Encode(init)
-					writer.Close()
+					announce()
 					continue
 				}
 				if msg.Type == bridge.MessagePing {
@@ -173,13 +186,14 @@ func run() error {
 				break loop
 			}
 		}
+		lastDone = time.Now()
 	}
 
 }
 
 // AppSync can drop events to a new subscription for a few seconds after acknowledging it, so the
 // worker announces itself only once it has heard its own ping.
-func awaitEcho(client *bridge.Client, channel string) {
+func awaitEcho(client *bridge.Client, channel string, other func(bridge.Message)) {
 	sent := map[string]bool{}
 	start := time.Now()
 	for time.Since(start) < 5*time.Second {
@@ -194,6 +208,9 @@ func awaitEcho(client *bridge.Client, channel string) {
 				if msg.Type == bridge.MessagePing && sent[msg.ID] {
 					fmt.Println("subscription live after", time.Since(start).Milliseconds(), "ms,", len(sent), "pings")
 					return
+				}
+				if other != nil {
+					other(msg)
 				}
 			case <-deadline:
 				break wait

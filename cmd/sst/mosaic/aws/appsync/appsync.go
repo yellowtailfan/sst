@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -88,6 +89,12 @@ type Connection struct {
 	realtimeEndpoint string
 	subscriptions    map[string]SubscriptionInfo
 	lock             sync.Mutex
+	generation       atomic.Int64
+}
+
+// Generation counts the connections made, so a caller can tell that its subscriptions were remade.
+func (c *Connection) Generation() int64 {
+	return c.generation.Load()
 }
 
 type SubscriptionInfo struct {
@@ -178,6 +185,7 @@ func (c *Connection) connect(ctx context.Context) error {
 		return ErrConnectionFailed
 	}
 	duration := time.Millisecond * time.Duration(msg["connectionTimeoutMs"].(float64))
+	c.generation.Add(1)
 
 	timer := time.NewTimer(duration)
 	go func() {
