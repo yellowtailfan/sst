@@ -95,6 +95,7 @@ func run() error {
 		return err
 	}
 	client := bridge.NewClient(ctx, conn, workerID, prefix+"/"+workerID)
+	awaitEcho(client, prefix+"/"+workerID+"/in")
 
 	init := bridge.InitBody{
 		FunctionID:  SST_FUNCTION_ID,
@@ -174,4 +175,30 @@ func run() error {
 		}
 	}
 
+}
+
+// AppSync can drop events to a new subscription for a few seconds after acknowledging it, so the
+// worker announces itself only once it has heard its own ping.
+func awaitEcho(client *bridge.Client, channel string) {
+	sent := map[string]bool{}
+	start := time.Now()
+	for time.Since(start) < 5*time.Second {
+		writer := client.NewWriter(bridge.MessagePing, channel)
+		sent[writer.ID()] = true
+		writer.Close()
+		deadline := time.After(500 * time.Millisecond)
+	wait:
+		for {
+			select {
+			case msg := <-client.Read():
+				if msg.Type == bridge.MessagePing && sent[msg.ID] {
+					fmt.Println("subscription live after", time.Since(start).Milliseconds(), "ms,", len(sent), "pings")
+					return
+				}
+			case <-deadline:
+				break wait
+			}
+		}
+	}
+	fmt.Println("subscription never echoed; announcing anyway")
 }

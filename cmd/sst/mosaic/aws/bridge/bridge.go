@@ -91,6 +91,10 @@ func (w *Writer) SetID(id string) {
 	w.id = id
 }
 
+func (w *Writer) ID() string {
+	return w.id
+}
+
 const BUFFER_SIZE = 1024 * 128
 
 func (w *Writer) Write(p []byte) (int, error) {

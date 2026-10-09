@@ -81,11 +81,6 @@ func function(ctx context.Context, input input) {
 	}
 	workerShutdownChan := make(chan *WorkerInfo, 1000)
 
-	// AppSync can drop events published to a subscription in its first seconds, even after
-	// subscribe_success. Every Init (a new bridge instance, or a reboot) is a new subscription, so a
-	// reply sent soon after one is sent a second time a little later; the bridge ignores duplicates.
-	var subscribedAt sync.Map
-
 	// A Node worker exits after 60s idle, and a request handed to it in that instant is lost with it:
 	// nothing answers and the bridge times out. So each request is held until the worker answers, and
 	// a worker that exits holding one is restarted with it. Once per request, so a handler that kills
@@ -100,23 +95,6 @@ func function(ctx context.Context, input input) {
 		inflightLock.Lock()
 		delete(inflight, workerID)
 		inflightLock.Unlock()
-	}
-	resend := func(message bridge.MessageType, workerID string, requestID string, body []byte) {
-		at, ok := subscribedAt.Load(workerID)
-		if !ok || time.Since(at.(time.Time)) > 6*time.Second {
-			return
-		}
-		go func() {
-			time.Sleep(1500 * time.Millisecond)
-			writer := input.client.NewWriter(message, input.prefix+"/"+workerID+"/in")
-			writer.SetID(requestID)
-			writer.Write(body)
-			if err := writer.Close(); err != nil {
-				log.Error("failed to resend to the bridge", "workerID", workerID, "err", err)
-				return
-			}
-			log.Info("resent to a new subscription", "workerID", workerID, "requestID", requestID)
-		}()
 	}
 	nextChan := map[string]chan io.Reader{}
 	workers := map[string]*WorkerInfo{}
@@ -201,7 +179,6 @@ func function(ctx context.Context, input input) {
 		if err := writer.Close(); err != nil {
 			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 		}
-		resend(bridge.MessageResponse, workerID, requestID, buf.Bytes())
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -227,7 +204,6 @@ func function(ctx context.Context, input input) {
 		if err := writer.Close(); err != nil {
 			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 		}
-		resend(bridge.MessageError, workerID, requestID, buf.Bytes())
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -337,7 +313,6 @@ func function(ctx context.Context, input input) {
 					continue
 				}
 				workerID := msg.Source
-				subscribedAt.Store(workerID, time.Now())
 				if _, ok := workers[workerID]; ok {
 					log.Error("got reboot but worker already exists", "workerID", workerID, "functionID", init.FunctionID)
 					continue
