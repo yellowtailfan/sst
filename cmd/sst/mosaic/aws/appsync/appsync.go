@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -88,6 +89,12 @@ type Connection struct {
 	realtimeEndpoint string
 	subscriptions    map[string]SubscriptionInfo
 	lock             sync.Mutex
+	generation       atomic.Int64
+}
+
+// Generation counts the connections made, so a caller can tell that its subscriptions were remade.
+func (c *Connection) Generation() int64 {
+	return c.generation.Load()
 }
 
 type SubscriptionInfo struct {
@@ -178,6 +185,7 @@ func (c *Connection) connect(ctx context.Context) error {
 		return ErrConnectionFailed
 	}
 	duration := time.Millisecond * time.Duration(msg["connectionTimeoutMs"].(float64))
+	c.generation.Add(1)
 
 	timer := time.NewTimer(duration)
 	go func() {
@@ -349,12 +357,45 @@ func (c *Connection) getAuth(ctx context.Context, body interface{}) (interface{}
 	return auth, nil
 }
 
+// publishClient never reuses a connection idle for more than 10s: a pooled connection that went
+// stale while idle fails its next request, and that request is a lost message.
+var publishClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.IdleConnTimeout = 10 * time.Second
+	if proxyURL, err := getProxyURL(true); err == nil && proxyURL != nil {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{Transport: transport, Timeout: 15 * time.Second}
+}()
+
+// Publish delivers one event, retrying a failed request: nothing upstream checks the error, so a
+// failure here is a message the other side never sees.
 func (c *Connection) Publish(ctx context.Context, channel string, event interface{}) error {
+	var err error
+	for attempt := 1; attempt <= 4; attempt++ {
+		err = c.publishOnce(ctx, channel, event)
+		if err == nil {
+			if attempt > 1 {
+				log.Warn("publish succeeded after retry", "channel", channel, "attempt", attempt)
+			}
+			return nil
+		}
+		log.Warn("publish failed", "channel", channel, "attempt", attempt, "err", err)
+		time.Sleep(time.Duration(attempt*attempt*100) * time.Millisecond)
+	}
+	log.Error("publish gave up", "channel", channel, "err", err)
+	return err
+}
+
+func (c *Connection) publishOnce(ctx context.Context, channel string, event interface{}) error {
 	credentials, err := c.cfg.Credentials.Retrieve(ctx)
 	if err != nil {
 		return err
 	}
 	eventJson, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
 	body, err := json.Marshal(map[string]interface{}{
 		"channel": channel,
 		"events":  []string{string(eventJson)},
@@ -376,18 +417,22 @@ func (c *Connection) Publish(ctx context.Context, channel string, event interfac
 		return err
 	}
 
-	// Use HTTP client that respects proxy settings
-	client := getHTTPClient()
-	resp, err := client.Do(req)
+	resp, err := publishClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
-
+	// A 200 can still report the event as not published.
+	var result struct {
+		Failed []json.RawMessage `json:"failed"`
+	}
+	if json.Unmarshal(bodyBytes, &result) == nil && len(result.Failed) > 0 {
+		return fmt.Errorf("event not published: %s", string(bodyBytes))
+	}
 	return nil
 }
