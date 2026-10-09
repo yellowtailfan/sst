@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -77,8 +78,46 @@ func function(ctx context.Context, input input) {
 		CurrentRequestID string
 		Env              []string
 		Streaming        bool
+		StartedAt        time.Time
 	}
 	workerShutdownChan := make(chan *WorkerInfo, 1000)
+
+	// A Node worker exits after 60s idle, and a request handed to it in that instant is lost with it:
+	// nothing answers and the bridge times out. So each request is held until the worker answers, and
+	// a worker that exits holding one is restarted with it. Once per request, so a handler that kills
+	// its own worker cannot loop.
+	type heldRequest struct {
+		raw      []byte
+		attempts int
+	}
+	// Replies kept a while after sending: AppSync can accept a publish and never deliver it, even to a
+	// subscription that has delivered before, so a bridge still waiting asks for its reply again.
+	type sentReply struct {
+		message  bridge.MessageType
+		workerID string
+		body     []byte
+		at       time.Time
+	}
+	var sentLock sync.Mutex
+	sent := map[string]*sentReply{}
+	remember := func(requestID string, reply *sentReply) {
+		sentLock.Lock()
+		defer sentLock.Unlock()
+		for id, r := range sent {
+			if time.Since(r.at) > 2*time.Minute {
+				delete(sent, id)
+			}
+		}
+		sent[requestID] = reply
+	}
+
+	var inflightLock sync.Mutex
+	inflight := map[string]*heldRequest{}
+	release := func(workerID string) {
+		inflightLock.Lock()
+		delete(inflight, workerID)
+		inflightLock.Unlock()
+	}
 	nextChan := map[string]chan io.Reader{}
 	workers := map[string]*WorkerInfo{}
 	evts := bus.Subscribe(&watcher.FileChangedEvent{}, &project.CompleteEvent{}, &runtime.BuildInput{}, &FunctionInvokedEvent{})
@@ -94,7 +133,16 @@ func function(ctx context.Context, input input) {
 			return
 		case reader := <-ch:
 			log.Info("worker got next request", "workerID", workerID)
-			resp, _ := http.ReadResponse(bufio.NewReader(reader), r)
+			raw, _ := io.ReadAll(reader)
+			inflightLock.Lock()
+			held, ok := inflight[workerID]
+			if !ok || !bytes.Equal(held.raw, raw) {
+				held = &heldRequest{raw: raw}
+				inflight[workerID] = held
+			}
+			held.attempts++
+			inflightLock.Unlock()
+			resp, _ := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), r)
 			requestID := resp.Header.Get("lambda-runtime-aws-request-id")
 			for key, values := range resp.Header {
 				for _, value := range values {
@@ -125,7 +173,9 @@ func function(ctx context.Context, input input) {
 		var buf bytes.Buffer
 		tee := io.TeeReader(r.Body, &buf)
 		io.Copy(writer, tee)
-		writer.Close()
+		if err := writer.Close(); err != nil {
+			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
+		}
 		w.WriteHeader(200)
 		info, ok := workers[workerID]
 		if ok {
@@ -142,13 +192,16 @@ func function(ctx context.Context, input input) {
 		workerID := r.PathValue("workerID")
 		requestID := r.PathValue("requestID")
 		log.Info("got response", "workerID", workerID, "requestID", r.PathValue("requestID"))
+		release(workerID)
 		writer := input.client.NewWriter(bridge.MessageResponse, input.prefix+"/"+workerID+"/in")
 		writer.SetID(requestID)
 		info, ok := workers[workerID]
 		if ok && info.Streaming {
 			writer.SetStreaming(true)
 			io.Copy(writer, r.Body)
-			writer.Close()
+			if err := writer.Close(); err != nil {
+				log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
+			}
 			w.WriteHeader(202)
 			bus.Publish(&FunctionResponseEvent{
 				FunctionID: info.FunctionID,
@@ -160,7 +213,11 @@ func function(ctx context.Context, input input) {
 			var buf bytes.Buffer
 			tee := io.TeeReader(r.Body, &buf)
 			io.Copy(writer, tee)
-			writer.Close()
+			if err := writer.Close(); err != nil {
+				log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
+			}
+			// A streamed reply is not kept, so only a buffered one can be sent again.
+			remember(requestID, &sentReply{bridge.MessageResponse, workerID, buf.Bytes(), time.Now()})
 			w.WriteHeader(202)
 			if ok {
 				bus.Publish(&FunctionResponseEvent{
@@ -177,12 +234,16 @@ func function(ctx context.Context, input input) {
 		workerID := r.PathValue("workerID")
 		requestID := r.PathValue("requestID")
 		log.Info("got error", "workerID", workerID, "requestID", r.PathValue("requestID"))
+		release(workerID)
 		writer := input.client.NewWriter(bridge.MessageError, input.prefix+"/"+workerID+"/in")
 		writer.SetID(requestID)
 		var buf bytes.Buffer
 		tee := io.TeeReader(r.Body, &buf)
 		io.Copy(writer, tee)
-		writer.Close()
+		if err := writer.Close(); err != nil {
+			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
+		}
+		remember(requestID, &sentReply{bridge.MessageError, workerID, buf.Bytes(), time.Now()})
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -260,6 +321,7 @@ func function(ctx context.Context, input input) {
 			Worker:     worker,
 			WorkerID:   workerID,
 			Streaming:  streaming,
+			StartedAt:  time.Now(),
 		}
 		go func() {
 			logs := worker.Logs()
@@ -299,6 +361,25 @@ func function(ctx context.Context, input input) {
 			return
 		case msg := <-input.msg:
 			switch msg.Type {
+			case bridge.MessageResend:
+				var body bridge.ResendBody
+				json.NewDecoder(msg.Body).Decode(&body)
+				sentLock.Lock()
+				reply, ok := sent[body.RequestID]
+				sentLock.Unlock()
+				// Not sent yet means the function is still running; the bridge asks again.
+				if !ok {
+					continue
+				}
+				writer := input.client.NewWriter(reply.message, input.prefix+"/"+reply.workerID+"/in")
+				writer.SetID(body.RequestID)
+				writer.Write(reply.body)
+				if err := writer.Close(); err != nil {
+					log.Error("failed to resend to the bridge", "workerID", reply.workerID, "err", err)
+					continue
+				}
+				log.Warn("resent a reply the bridge did not receive", "workerID", reply.workerID, "requestID", body.RequestID)
+				continue
 			case bridge.MessageInit:
 				ch, ok := nextChan[msg.Source]
 				if !ok {
@@ -351,7 +432,9 @@ func function(ctx context.Context, input input) {
 			case bridge.MessageNext:
 				writer := input.client.NewWriter(bridge.MessagePing, input.prefix+"/"+msg.Source+"/in")
 				json.NewEncoder(writer).Encode(bridge.PingBody{})
-				writer.Close()
+				if err := writer.Close(); err != nil {
+					log.Error("failed to send ping", "workerID", msg.Source, "err", err)
+				}
 				ch, ok := nextChan[msg.Source]
 				if !ok {
 					ch = make(chan io.Reader, 100)
@@ -376,6 +459,28 @@ func function(ctx context.Context, input input) {
 			}
 			// only delete if a new worker hasn't already been started
 			if existing == info {
+				inflightLock.Lock()
+				held, holding := inflight[info.WorkerID]
+				delete(inflight, info.WorkerID)
+				inflightLock.Unlock()
+				ch := nextChan[info.WorkerID]
+				// A request handed over and unanswered, or one queued behind a worker that had been
+				// running a while (not one that died on startup).
+				retry := holding && held.attempts < 2
+				queued := ch != nil && len(ch) > 0 && time.Since(info.StartedAt) > 5*time.Second
+				if retry || queued {
+					log.Warn("worker exited holding a request; restarting it", "workerID", info.WorkerID)
+					delete(workers, info.WorkerID)
+					if startWorker(info.FunctionID, info.WorkerID) {
+						if retry {
+							inflightLock.Lock()
+							inflight[info.WorkerID] = held
+							inflightLock.Unlock()
+							ch <- bytes.NewReader(held.raw)
+						}
+						break
+					}
+				}
 				log.Info("deleting worker", "workerID", info.WorkerID)
 				delete(workers, info.WorkerID)
 				delete(nextChan, info.WorkerID)
