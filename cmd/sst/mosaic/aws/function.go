@@ -89,6 +89,27 @@ func function(ctx context.Context, input input) {
 		raw      []byte
 		attempts int
 	}
+	// Replies kept a while after sending: AppSync can accept a publish and never deliver it, even to a
+	// subscription that has delivered before, so a bridge still waiting asks for its reply again.
+	type sentReply struct {
+		message  bridge.MessageType
+		workerID string
+		body     []byte
+		at       time.Time
+	}
+	var sentLock sync.Mutex
+	sent := map[string]*sentReply{}
+	remember := func(requestID string, reply *sentReply) {
+		sentLock.Lock()
+		defer sentLock.Unlock()
+		for id, r := range sent {
+			if time.Since(r.at) > 2*time.Minute {
+				delete(sent, id)
+			}
+		}
+		sent[requestID] = reply
+	}
+
 	var inflightLock sync.Mutex
 	inflight := map[string]*heldRequest{}
 	release := func(workerID string) {
@@ -179,6 +200,7 @@ func function(ctx context.Context, input input) {
 		if err := writer.Close(); err != nil {
 			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 		}
+		remember(requestID, &sentReply{bridge.MessageResponse, workerID, buf.Bytes(), time.Now()})
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -204,6 +226,7 @@ func function(ctx context.Context, input input) {
 		if err := writer.Close(); err != nil {
 			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 		}
+		remember(requestID, &sentReply{bridge.MessageError, workerID, buf.Bytes(), time.Now()})
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -300,6 +323,25 @@ func function(ctx context.Context, input input) {
 			return
 		case msg := <-input.msg:
 			switch msg.Type {
+			case bridge.MessageResend:
+				var body bridge.ResendBody
+				json.NewDecoder(msg.Body).Decode(&body)
+				sentLock.Lock()
+				reply, ok := sent[body.RequestID]
+				sentLock.Unlock()
+				// Not sent yet means the function is still running; the bridge asks again.
+				if !ok {
+					continue
+				}
+				writer := input.client.NewWriter(reply.message, input.prefix+"/"+reply.workerID+"/in")
+				writer.SetID(body.RequestID)
+				writer.Write(reply.body)
+				if err := writer.Close(); err != nil {
+					log.Error("failed to resend to the bridge", "workerID", reply.workerID, "err", err)
+					continue
+				}
+				log.Warn("resent a reply the bridge did not receive", "workerID", reply.workerID, "requestID", body.RequestID)
+				continue
 			case bridge.MessageInit:
 				ch, ok := nextChan[msg.Source]
 				if !ok {

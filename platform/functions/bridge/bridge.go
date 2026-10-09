@@ -152,13 +152,26 @@ func run() error {
 			continue
 		}
 		timeout := time.Second * 16
+		timer := time.NewTimer(timeout)
+		// Once sst dev has the request (its ping), a reply that does not arrive is asked for again:
+		// AppSync can accept a publish and never deliver it.
+		resend := time.NewTicker(time.Second)
+		pinged := false
 
 	loop:
 		for {
 			select {
 			case <-ctx.Done():
 				return nil
+			case <-resend.C:
+				if pinged {
+					writer := client.NewWriter(bridge.MessageResend, prefix+"/in")
+					json.NewEncoder(writer).Encode(bridge.ResendBody{RequestID: requestID})
+					writer.Close()
+					fmt.Println("asked for the reply again", requestID)
+				}
 			case msg := <-client.Read():
+				timer.Reset(timeout)
 				fmt.Println("got message", msg.Type)
 				if msg.Type == bridge.MessageResponse && msg.ID == requestID {
 					http.Post("http://"+LAMBDA_RUNTIME_API+"/2018-06-01/runtime/invocation/"+requestID+"/response", "application/json", msg.Body)
@@ -178,14 +191,18 @@ func run() error {
 				}
 				if msg.Type == bridge.MessagePing {
 					timeout = time.Minute * 15
+					timer.Reset(timeout)
+					pinged = true
 					continue
 				}
-			case <-time.After(timeout):
+			case <-timer.C:
 				fmt.Println("timeout", requestID)
 				http.Post("http://"+LAMBDA_RUNTIME_API+"/2018-06-01/runtime/invocation/"+requestID+"/response", "application/json", bytes.NewReader(notRunning))
 				break loop
 			}
 		}
+		resend.Stop()
+		timer.Stop()
 		lastDone = time.Now()
 	}
 

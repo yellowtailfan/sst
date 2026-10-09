@@ -34,6 +34,9 @@ const (
 
 	MessageTaskStart
 	MessageTaskComplete
+
+	// A bridge asking for a reply it has not received, by ResendBody.
+	MessageResend
 )
 
 type Message struct {
@@ -72,6 +75,10 @@ type PingBody struct {
 }
 
 type RebootBody struct {
+}
+
+type ResendBody struct {
+	RequestID string `json:"requestID"`
 }
 
 func newWriter(conn *appsync.Connection, source string, channel string, message MessageType) *Writer {
