@@ -97,6 +97,7 @@ func function(ctx context.Context, input input) {
 		workerID string
 		body     []byte
 		at       time.Time
+		resentAt time.Time
 	}
 	var sentLock sync.Mutex
 	sent := map[string]*sentReply{}
@@ -217,7 +218,7 @@ func function(ctx context.Context, input input) {
 				log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 			}
 			// A streamed reply is not kept, so only a buffered one can be sent again.
-			remember(requestID, &sentReply{bridge.MessageResponse, workerID, buf.Bytes(), time.Now()})
+			remember(requestID, &sentReply{message: bridge.MessageResponse, workerID: workerID, body: buf.Bytes(), at: time.Now()})
 			w.WriteHeader(202)
 			if ok {
 				bus.Publish(&FunctionResponseEvent{
@@ -243,7 +244,7 @@ func function(ctx context.Context, input input) {
 		if err := writer.Close(); err != nil {
 			log.Error("failed to send to the bridge", "workerID", workerID, "err", err)
 		}
-		remember(requestID, &sentReply{bridge.MessageError, workerID, buf.Bytes(), time.Now()})
+		remember(requestID, &sentReply{message: bridge.MessageError, workerID: workerID, body: buf.Bytes(), at: time.Now()})
 		w.WriteHeader(202)
 		info, ok := workers[workerID]
 		if ok {
@@ -365,21 +366,30 @@ func function(ctx context.Context, input input) {
 			case bridge.MessageResend:
 				var body bridge.ResendBody
 				json.NewDecoder(msg.Body).Decode(&body)
+				// Not sent yet means the function is still running; the bridge asks again. A large
+				// reply is still arriving for a while after it was sent, and every ask would resend
+				// all of it, so asks soon after the send, or after the last resend, are ignored.
 				sentLock.Lock()
 				reply, ok := sent[body.RequestID]
+				due := ok && time.Since(reply.at) > 1500*time.Millisecond && time.Since(reply.resentAt) > 2*time.Second
+				if due {
+					reply.resentAt = time.Now()
+				}
 				sentLock.Unlock()
-				// Not sent yet means the function is still running; the bridge asks again.
-				if !ok {
+				if !due {
 					continue
 				}
-				writer := input.client.NewWriter(reply.message, input.prefix+"/"+reply.workerID+"/in")
-				writer.SetID(body.RequestID)
-				writer.Write(reply.body)
-				if err := writer.Close(); err != nil {
-					log.Error("failed to resend to the bridge", "workerID", reply.workerID, "err", err)
-					continue
-				}
-				log.Warn("resent a reply the bridge did not receive", "workerID", reply.workerID, "requestID", body.RequestID)
+				// Off the loop: a large reply is many publishes, and the loop serves every worker.
+				go func(requestID string, reply *sentReply) {
+					writer := input.client.NewWriter(reply.message, input.prefix+"/"+reply.workerID+"/in")
+					writer.SetID(requestID)
+					writer.Write(reply.body)
+					if err := writer.Close(); err != nil {
+						log.Error("failed to resend to the bridge", "workerID", reply.workerID, "err", err)
+						return
+					}
+					log.Warn("resent a reply the bridge did not receive", "workerID", reply.workerID, "requestID", requestID)
+				}(body.RequestID, reply)
 				continue
 			case bridge.MessageInit:
 				ch, ok := nextChan[msg.Source]
